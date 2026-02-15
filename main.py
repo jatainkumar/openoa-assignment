@@ -13,18 +13,34 @@ import os
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+from fastapi.middleware.cors import CORSMiddleware
+
 app = FastAPI(title="OpenOA Web API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/")
 async def root():
     return FileResponse('index.html')
 
+from pydantic import BaseModel
+
+class SimulationConfig(BaseModel):
+    capacity_mw: float = 8.2
+    num_simulations: int = 100
+
 @app.post("/calculate")
-async def calculate():
+async def calculate(config: SimulationConfig):
     try:
         data_path = Path("examples/data/la_haute_borne")
         
-        logger.info("Loading project data...")
+        logger.info(f"Loading project data. Capacity: {config.capacity_mw}MW, Sims: {config.num_simulations}")
         
         # Load Asset Data
         asset_df = pd.read_csv(data_path / "la-haute-borne-asset_table.csv")
@@ -54,16 +70,16 @@ async def calculate():
         # ERA5 cols: [index], datetime, ws_100m, u_100, v_100, dens_100m...
         
         era5_cols = ["datetime", "ws_100m", "u_100", "v_100", "dens_100m"]
-        era5_df = pd.read_csv(data_path / "era5_wind_la_haute_borne.csv", index_col=0, usecols=[0] + era5_cols)
+        era5_df = pd.read_csv(data_path / "era5_wind_la_haute_borne.csv", index_col=0)
         era5_df["datetime"] = pd.to_datetime(era5_df["datetime"], utc=True).dt.tz_localize(None)
         
         merra2_cols = ["datetime", "ws_50m", "u_50", "v_50", "dens_50m"]
-        merra2_df = pd.read_csv(data_path / "merra2_la_haute_borne.csv", index_col=0, usecols=[0] + merra2_cols)
+        merra2_df = pd.read_csv(data_path / "merra2_la_haute_borne.csv", index_col=0)
         merra2_df["datetime"] = pd.to_datetime(merra2_df["datetime"], utc=True).dt.tz_localize(None)
 
         # Define Metadata based on verified mapping
         metadata = {
-            "capacity": 8.2,
+            "capacity": config.capacity_mw,
             "asset": {
                 "asset_id": "Wind_turbine_name",
                 "latitude": "Latitude",
@@ -114,17 +130,25 @@ async def calculate():
 
         logger.info("Running AEP Monte Carlo analysis...")
         pa = MonteCarloAEP(plant)
-        pa.run(num_sim=5, progress_bar=False)
+        pa.run(num_sim=config.num_simulations, progress_bar=False) # Increased simulations for better distribution
 
         # Access results. MonteCarloAEP provides 'results' dataframe with summarized stats.
         # pa.results is a DataFrame where columns are 'aep_GWh', 'avail_pct', etc.
         aep_mean = float(pa.results['aep_GWh'].mean())
         aep_std = float(pa.results['aep_GWh'].std()) if 'aep_GWh' in pa.results else 0.0
 
+        # Calculate duration
+        start_date = meter_df["time_utc"].min()
+        end_date = meter_df["time_utc"].max()
+        years_involved = f"{start_date.year}-{end_date.year}"
+
         return {
             "status": "success",
+            "capacity_mw": config.capacity_mw,
+            "period": years_involved,
             "aep_GWh": aep_mean,
             "aep_std": aep_std,
+            "aep_distribution": pa.results['aep_GWh'].tolist(),
             "metrics": pa.results.mean().to_dict()
         }
 
